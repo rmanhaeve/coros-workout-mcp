@@ -528,6 +528,45 @@ export async function addProgram(
   return result.data;
 }
 
+/**
+ * Update an existing program in place. Same payload as addProgram but the
+ * payload MUST carry the existing program's `id`. POST /training/program/update.
+ */
+export async function updateProgram(
+  auth: AuthData,
+  payload: WorkoutPayload,
+  calculated: CalculateResult
+): Promise<void> {
+  if (!payload.id || payload.id === "0") {
+    throw new Error("updateProgram requires payload.id (the existing workout id)");
+  }
+  payload.duration = calculated.duration;
+  payload.totalSets = calculated.totalSets;
+  payload.distance = String(calculated.distance ?? 0);
+  payload.sets = calculated.totalSets;
+  payload.pitch = 0;
+  await apiPost(auth, "/training/program/update", payload);
+}
+
+/** Fetch a plan's full stored document (for editing via plan/update). */
+export async function getPlanDetail(
+  auth: AuthData,
+  id: string,
+  region = 3
+): Promise<Record<string, unknown>> {
+  const result = (await apiGet(auth, "/training/plan/detail", {
+    id,
+    region,
+    supportRestExercise: 1,
+  })) as { data: Record<string, unknown> };
+  return result.data;
+}
+
+/** Persist an edited plan document in place. POST /training/plan/update. */
+export async function updatePlan(auth: AuthData, body: unknown): Promise<void> {
+  await apiPost(auth, "/training/plan/update", body);
+}
+
 export async function calculateWorkout(
   auth: AuthData,
   name: string,

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildTrainingPlanPayload,
+  buildPlanUpdatePayload,
   weeklyWorkoutCountRange,
   dayNoFromDates,
   toHappenDay,
@@ -114,5 +115,48 @@ describe("buildTrainingPlanPayload", () => {
     expect(() =>
       buildTrainingPlanPayload({ name: "T", region: 3, placements: [{ program: prog("1", "x"), dayNo: -1 }] })
     ).toThrow();
+  });
+});
+
+describe("buildPlanUpdatePayload", () => {
+  const detail = () => ({
+    id: "PLAN1",
+    name: "N1117",
+    overview: "old",
+    totalDay: 3,
+    minWeeks: 2,
+    maxWeeks: 2,
+    versionObjects: [],
+    entities: [
+      { idInPlan: "1", dayNo: 0, planProgramId: "1" },
+      { idInPlan: "2", dayNo: 2, planProgramId: "2" },
+    ],
+  });
+
+  it("moves a workout's day, recomputes totalDay, and marks it status 2", () => {
+    const body = buildPlanUpdatePayload(detail(), { moves: [{ fromDay: 2, toDay: 5 }] });
+    const ents = body.entities as Array<Record<string, unknown>>;
+    expect(ents.find((e) => e.idInPlan === "2")!.dayNo).toBe(5);
+    expect(body.totalDay).toBe(6);
+    expect(body.versionObjects).toEqual([
+      { id: "2", planProgramId: "2", planId: "PLAN1", status: 2, type: 0 },
+    ]);
+  });
+
+  it("renames without moves (empty versionObjects)", () => {
+    const body = buildPlanUpdatePayload(detail(), { name: "New", overview: "desc" });
+    expect(body.name).toBe("New");
+    expect(body.overview).toBe("desc");
+    expect(body.versionObjects).toEqual([]);
+  });
+
+  it("does not mutate the input detail", () => {
+    const d = detail();
+    buildPlanUpdatePayload(d, { moves: [{ fromDay: 2, toDay: 5 }] });
+    expect(d.entities[1].dayNo).toBe(2);
+  });
+
+  it("throws when a move targets a day with no workout", () => {
+    expect(() => buildPlanUpdatePayload(detail(), { moves: [{ fromDay: 4, toDay: 1 }] })).toThrow();
   });
 });

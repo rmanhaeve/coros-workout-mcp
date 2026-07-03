@@ -76,3 +76,28 @@ curl 'https://teameuapi.coros.com/training/schedule/quitSubPlan?subPlanId=REDACT
   -H 'yfheader: {"userId":"000000000000000000"}' \
   --data-raw '{}' ;
 # response: {"apiCode":"...","message":"OK","result":"0000"}
+
+
+# ============================================================================
+# EDITING (in place)
+# ============================================================================
+#
+# --- POST /training/program/update (edit a workout in place) ---
+# Same body as /training/program/add but with the existing program `id` set.
+# Replaces the workout's exercises/steps wholesale. Verified for running
+# (sportType 1) and strength (sportType 4). returns {"result":"0000"}.
+#   body: { ...same as program/add..., "id": "<existingProgramId>" }
+#
+# --- POST /training/plan/update (edit a plan in place) ---
+# A full-document PUT: echo the plan/detail document back with modifications.
+# Key fields: top-level `id` (plan id), the full entities[]/programs[], and a
+# DIFFERENTIAL `versionObjects[]` describing what changed:
+#   status 1 = newly added entity   (also carries onlyId uuid + new program)
+#   status 2 = existing/modified entity (moved day, etc.)
+#   (unchanged entities are omitted from versionObjects)
+# Recompute totalDay (= max dayNo + 1) and min/maxWeeks (min/max workouts per
+# content-bearing week). Verified: moving a workout to another day with a single
+# {id, planProgramId, planId, status:2, type:0} versionObject -> {"result":"0000"}
+# and plan/detail reflects the new dayNo.
+#   body: { ...plan/detail..., "id":"<planId>", entities:[...moved...],
+#           versionObjects:[{id,planProgramId,planId,status:2,type:0}], ... }

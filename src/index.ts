@@ -24,6 +24,10 @@ import {
   quitSubPlan,
   querySchedule,
   queryPlans,
+  buildWorkoutPayload,
+  updateProgram,
+  getPlanDetail,
+  updatePlan,
 } from "./coros-api.js";
 import {
   buildRunningWorkoutPayload,
@@ -31,6 +35,7 @@ import {
 } from "./running.js";
 import {
   buildTrainingPlanPayload,
+  buildPlanUpdatePayload,
   dayNoFromDates,
   toHappenDay,
   happenDayFromStart,
@@ -917,6 +922,134 @@ server.tool(
       return { content: [{ type: "text" as const, text: `Deleted ${planIds.length} plan template(s): ${planIds.join(", ")}.` }] };
     } catch (error) {
       return { content: [{ type: "text" as const, text: `Failed to delete plan(s): ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// --- Tool: update_workout ---
+// Edit an existing workout in place (POST /training/program/update). Replaces
+// the workout's steps/exercises wholesale — same builders as the create tools,
+// with the existing id set. Provide `steps` for a running workout or
+// `exercises` for strength (must match the workout's existing sport).
+server.tool(
+  "update_workout",
+  "Edit an existing COROS workout in place (does NOT create a copy). Provide the workoutId and the FULL new definition: `steps` for a running workout, or `exercises` for a strength workout (must match the workout's sport). Name/steps are replaced wholesale. Note: a workout already placed on the calendar is an independent copy — editing the library workout won't change the scheduled one.",
+  {
+    workoutId: z.string().describe("Id of the existing workout/program to edit."),
+    name: z.string().describe("New workout name."),
+    overview: z.string().default("").describe("New description."),
+    steps: z
+      .array(z.union([RepeatBlockSchema, RunStepSchema]))
+      .min(1)
+      .optional()
+      .describe("Running steps/repeat blocks (running workouts). Mutually exclusive with exercises."),
+    exercises: z
+      .array(ExerciseInputSchema)
+      .min(1)
+      .optional()
+      .describe("Strength exercises (strength workouts). Mutually exclusive with steps."),
+  },
+  async ({ workoutId, name, overview, steps, exercises }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      if (Number(!!steps) + Number(!!exercises) !== 1) {
+        throw new Error("Provide exactly one of steps (running) or exercises (strength).");
+      }
+
+      let payload;
+      if (steps) {
+        let paceCtx: { ltsp?: number | null; ltspZone?: number[] } = {};
+        try {
+          paceCtx = await getAccountZones(auth);
+        } catch {
+          paceCtx = {};
+        }
+        payload = buildRunningWorkoutPayload(name, overview, steps as RunningItemInput[], paceCtx);
+      } else {
+        const missing = exercises!.filter((ex) => !findByName(ex.name)).map((ex) => ex.name);
+        if (missing.length > 0) {
+          throw new Error(`Exercises not found in catalog: ${missing.map((n) => `"${n}"`).join(", ")}. Use search_exercises.`);
+        }
+        payload = buildWorkoutPayload(name, overview, resolveExercises(exercises!));
+      }
+      payload.id = workoutId;
+
+      const calculated = await calculateProgram(auth, payload);
+      await updateProgram(auth, payload, calculated);
+
+      const durationMin = Math.round((calculated.duration || 0) / 60);
+      const distanceKm = steps && calculated.distance ? ` | Distance: ${(calculated.distance / 100000).toFixed(2)} km` : "";
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Workout "${name}" (id ${workoutId}) updated.`,
+              `Duration: ~${durationMin} min${distanceKm} | Training load: ${calculated.trainingLoad}`,
+              `Changes sync to your COROS watch.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to update workout: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// --- Tool: update_plan ---
+// Edit an existing plan in place (POST /training/plan/update): move workouts to
+// different days and/or rename. Fetches the plan document, applies the edits,
+// and PUTs it back (marking moved entities status 2 in versionObjects).
+server.tool(
+  "update_plan",
+  "Edit an existing COROS plan template in place: move workouts to different days (by 0-based day offset) and/or rename it. Use list_training_plans to find the planId. To change which workouts are in a plan, or to reschedule calendar workouts, use schedule_workouts / unschedule_workouts instead.",
+  {
+    planId: z.string().describe("Id of the plan to edit (from list_training_plans)."),
+    name: z.string().optional().describe("New plan name (optional)."),
+    overview: z.string().optional().describe("New plan description (optional)."),
+    moves: z
+      .array(
+        z.object({
+          fromDay: z.number().int().min(0).describe("Current day offset of the workout(s) to move (0-based)."),
+          toDay: z.number().int().min(0).describe("New day offset."),
+        })
+      )
+      .optional()
+      .describe("Day moves. Every workout currently on fromDay moves to toDay."),
+  },
+  async ({ planId, name, overview, moves }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      if (name === undefined && overview === undefined && (!moves || moves.length === 0)) {
+        throw new Error("Nothing to change: provide name, overview, and/or moves.");
+      }
+      const detail = await getPlanDetail(auth, planId, REGION_IDS[auth.region] ?? 3);
+      const body = buildPlanUpdatePayload(detail, { moves, name, overview });
+      await updatePlan(auth, body);
+
+      const layout = (body.entities as Array<Record<string, unknown>>)
+        .map((e) => Number(e.dayNo))
+        .sort((a, b) => a - b);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Plan "${body.name}" (id ${planId}) updated.`,
+              `${layout.length} workout(s) across ${body.totalDay} day(s); day offsets: ${layout.join(", ")}.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to update plan: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
     }
   }
 );

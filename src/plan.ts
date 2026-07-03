@@ -140,6 +140,70 @@ function parseISODate(iso: string): Date {
   return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
 }
 
+/** In-place edits to an existing plan (see buildPlanUpdatePayload). */
+export interface PlanEdits {
+  /** Move every workout on `fromDay` (0-based dayNo) to `toDay`. */
+  moves?: Array<{ fromDay: number; toDay: number }>;
+  /** New plan name. */
+  name?: string;
+  /** New plan description. */
+  overview?: string;
+}
+
+/**
+ * Build a /training/plan/update body from a plan's stored detail document plus
+ * a set of edits. plan/update is a full-document PUT: we echo `detail` back with
+ * modifications, recompute totalDay/min/maxWeeks, and mark each changed entity
+ * in versionObjects as status 2 (existing/modified) — the form the server
+ * accepts (verified against a live move-a-day edit).
+ */
+export function buildPlanUpdatePayload(
+  detail: Record<string, unknown>,
+  edits: PlanEdits
+): Record<string, unknown> {
+  const body = JSON.parse(JSON.stringify(detail)) as Record<string, unknown>;
+  const entities = (body.entities as Array<Record<string, unknown>>) ?? [];
+  if (entities.length === 0) throw new Error("Plan has no entities to edit");
+
+  const changed = new Set<string>();
+  for (const m of edits.moves ?? []) {
+    if (!Number.isInteger(m.toDay) || m.toDay < 0) {
+      throw new Error(`toDay must be a non-negative integer (got ${m.toDay})`);
+    }
+    let matched = false;
+    for (const e of entities) {
+      if (Number(e.dayNo) === m.fromDay) {
+        e.dayNo = m.toDay;
+        changed.add(String(e.idInPlan));
+        matched = true;
+      }
+    }
+    if (!matched) throw new Error(`No workout found on day ${m.fromDay}`);
+  }
+
+  if (edits.name !== undefined) body.name = edits.name;
+  if (edits.overview !== undefined) body.overview = edits.overview;
+
+  const dayNos = entities.map((e) => Number(e.dayNo));
+  body.totalDay = Math.max(...dayNos) + 1;
+  const { minWeeks, maxWeeks } = weeklyWorkoutCountRange(dayNos);
+  body.minWeeks = minWeeks;
+  body.maxWeeks = maxWeeks;
+
+  body.versionObjects = [...changed].map((id) => {
+    const e = entities.find((x) => String(x.idInPlan) === id)!;
+    return {
+      id: String(id),
+      planProgramId: String(e.planProgramId ?? id),
+      planId: body.id,
+      status: 2,
+      type: 0,
+    };
+  });
+
+  return body;
+}
+
 /** Assemble the /training/plan/add body from placed program-detail objects. */
 export function buildTrainingPlanPayload(opts: BuildPlanOptions): TrainingPlanPayload {
   const { placements } = opts;
