@@ -12,6 +12,7 @@ import {
   addWorkout,
   calculateProgram,
   addProgram,
+  getAccountZones,
   queryWorkouts,
   queryExerciseCatalog,
   fetchI18nStrings,
@@ -284,6 +285,12 @@ const RunStepSchema = z.object({
   timeSeconds: z.number().positive().optional().describe("Time target in seconds (e.g. 720 for 12 min)"),
   paceFast: z.string().optional().describe('Fast end of pace target, "m:ss" per km (e.g. "3:54")'),
   paceSlow: z.string().optional().describe('Slow end of pace target, "m:ss" per km (e.g. "4:18")'),
+  zone: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe("COROS running pace zone (1..6); resolves to that zone's pace band. Alternative to paceFast/paceSlow."),
 });
 const RepeatBlockSchema = z.object({
   repeat: z.number().int().min(1).describe("Number of times to repeat the child steps"),
@@ -316,7 +323,21 @@ server.tool(
         };
       }
 
-      const payload = buildRunningWorkoutPayload(name, overview, steps as RunningItemInput[]);
+      // Fetch the athlete's pace reference so pace/zone targets encode exactly
+      // (percent-of-threshold). Non-fatal: fall back to absolute-only if unavailable.
+      let paceCtx: { ltsp?: number | null; ltspZone?: number[] } = {};
+      try {
+        paceCtx = await getAccountZones(auth);
+      } catch {
+        paceCtx = {};
+      }
+
+      const payload = buildRunningWorkoutPayload(
+        name,
+        overview,
+        steps as RunningItemInput[],
+        paceCtx
+      );
       const calculated = await calculateProgram(auth, payload);
 
       if (!calculateOnly) {

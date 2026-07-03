@@ -135,6 +135,29 @@ async function apiGet(
   return data;
 }
 
+export interface AccountZones {
+  /** Lactate-threshold speed/pace (ltsp), seconds per km. null if unset on the profile. */
+  ltsp: number | null;
+  /** Running pace-zone boundaries, seconds per km, ordered by zone index (slow→fast). */
+  ltspZone: number[];
+}
+
+/**
+ * Fetch the athlete's running pace reference from /account/query.
+ * The Training Hub derives pace-target percentages from `ltsp`; we do the same.
+ */
+export async function getAccountZones(auth: AuthData): Promise<AccountZones> {
+  const result = (await apiGet(auth, "/account/query", {})) as {
+    data?: { zoneData?: { ltsp?: number; ltspZone?: Array<{ index: number; pace: number }> } };
+  };
+  const zd = result.data?.zoneData;
+  const ltspZone = (zd?.ltspZone ?? [])
+    .slice()
+    .sort((a, b) => a.index - b.index)
+    .map((z) => z.pace);
+  return { ltsp: zd?.ltsp ?? null, ltspZone };
+}
+
 /** Fetch the full exercise catalog from COROS API */
 export async function queryExerciseCatalog(
   auth: AuthData,

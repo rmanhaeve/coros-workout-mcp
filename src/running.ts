@@ -73,6 +73,19 @@ export interface RunStepInput {
   paceFast?: string;
   /** Slow end of the pace target, "m:ss" per km (e.g. "4:18"). Optional. */
   paceSlow?: string;
+  /**
+   * COROS running pace zone (1..N). Resolves to that zone's pace band from the
+   * athlete's ltspZone. Mutually exclusive with paceFast/paceSlow.
+   */
+  zone?: number;
+}
+
+/** Athlete pace reference used to encode pace targets (from getAccountZones). */
+export interface PaceContext {
+  /** Lactate-threshold pace, seconds per km. */
+  ltsp?: number | null;
+  /** Pace-zone boundaries, seconds per km, ordered by zone index (slow→fast). */
+  ltspZone?: number[];
 }
 
 export interface RepeatBlockInput {
@@ -91,12 +104,50 @@ function isRepeat(item: RunningItemInput): item is RepeatBlockInput {
 
 // --- Encoding helpers ---
 
-/** "m:ss" per km -> milliseconds per km (COROS pace encoding). */
-export function paceToMsPerKm(pace: string): number {
+/** "m:ss" per km -> seconds per km. */
+export function paceToSecPerKm(pace: string): number {
   const m = /^(\d+):(\d{1,2})$/.exec(pace.trim());
   if (!m) throw new Error(`Invalid pace "${pace}" (expected "m:ss" per km, e.g. "4:00")`);
-  const seconds = Number(m[1]) * 60 + Number(m[2]);
-  return seconds * 1000;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/** "m:ss" per km -> milliseconds per km (COROS pace encoding). */
+export function paceToMsPerKm(pace: string): number {
+  return paceToSecPerKm(pace) * 1000;
+}
+
+/**
+ * COROS pace-target percentage of threshold: round(ltsp / paceSec * 100000).
+ * ltsp and paceSec are both seconds per km. Verified against captured payloads.
+ */
+export function pacePercentOfLtsp(paceSec: number, ltsp: number): number {
+  return Math.round((ltsp / paceSec) * 100000);
+}
+
+/** Resolve a step's pace target to fast/slow bounds in seconds per km (0 = open). */
+function resolvePaceBounds(
+  input: RunStepInput,
+  ctx: PaceContext
+): { fastSec: number; slowSec: number } {
+  const hasExplicit = input.paceFast !== undefined || input.paceSlow !== undefined;
+  if (input.zone !== undefined) {
+    if (hasExplicit) {
+      throw new Error(`Step "${input.type}" cannot set both zone and paceFast/paceSlow`);
+    }
+    const zones = ctx.ltspZone;
+    if (!zones || zones.length < 2) {
+      throw new Error(`zone target needs pace zones; none available (fetch account zones first)`);
+    }
+    // Zone Z spans ltspZone[Z] (fast) .. ltspZone[Z-1] (slow). Z in 1..len-1.
+    if (input.zone < 1 || input.zone > zones.length - 1) {
+      throw new Error(`zone ${input.zone} out of range (1..${zones.length - 1})`);
+    }
+    return { fastSec: zones[input.zone], slowSec: zones[input.zone - 1] };
+  }
+  return {
+    fastSec: input.paceFast ? paceToSecPerKm(input.paceFast) : 0,
+    slowSec: input.paceSlow ? paceToSecPerKm(input.paceSlow) : 0,
+  };
 }
 
 interface RunningStepPayload {
@@ -143,7 +194,8 @@ function buildLeafStep(
   input: RunStepInput,
   id: number,
   sortNo: number,
-  groupId: number | string
+  groupId: number | string,
+  ctx: PaceContext
 ): RunningStepPayload {
   const tpl = STEP_TEMPLATES[input.type];
   if (input.distanceMeters === undefined && input.timeSeconds === undefined) {
@@ -167,20 +219,22 @@ function buildLeafStep(
     targetDisplayUnit = 2;
   }
 
-  // Intensity: pace range (intensityType 8) if any pace given, else free (0).
-  //
-  // KNOWN LIMITATION: COROS's pace model is "%adjustedPace" — when
-  // isIntensityPercent=true the intensityPercent/intensityPercentExtend fields
-  // (percent of the athlete's threshold pace) are the source of truth, and we
-  // currently leave them 0. The absolute intensityValue/intensityValueExtend
-  // (ms/km) below are accepted by /calculate (result 0000) and round-trip
-  // structurally, but the Training Hub's duration/load ESTIMATE ignores them,
-  // and on-watch pace-target display is unconfirmed. To make estimates + watch
-  // targets exact, fetch the athlete's threshold ("adjusted") pace and compute
-  // the percent fields. Tracked for a follow-up; needs a pace-zones capture.
-  const hasPace = input.paceFast !== undefined || input.paceSlow !== undefined;
-  const intensityValue = input.paceFast ? paceToMsPerKm(input.paceFast) : 0;
-  const intensityValueExtend = input.paceSlow ? paceToMsPerKm(input.paceSlow) : 0;
+  // Intensity: pace target (intensityType 8) if a pace/zone is given, else free.
+  // Encoding (verified against captured payloads):
+  //   intensityValue        = fast bound (ms/km), 0 if open
+  //   intensityValueExtend  = slow bound (ms/km), 0 if open
+  //   intensityPercentExtend = %-of-ltsp for the FAST bound (or the single bound)
+  //   intensityPercent       = %-of-ltsp for the SLOW bound (only when two-sided)
+  // where % = round(ltsp / paceSec * 100000). ltsp comes from getAccountZones;
+  // if absent, the % fields stay 0 (still accepted, estimates less exact).
+  const { fastSec, slowSec } = resolvePaceBounds(input, ctx);
+  const hasPace = fastSec > 0 || slowSec > 0;
+  const intensityValue = fastSec * 1000;
+  const intensityValueExtend = slowSec * 1000;
+  const ltsp = ctx.ltsp ?? null;
+  const primaryFastSec = fastSec > 0 ? fastSec : slowSec; // fall back for single-sided
+  const intensityPercentExtend = ltsp && primaryFastSec > 0 ? pacePercentOfLtsp(primaryFastSec, ltsp) : 0;
+  const intensityPercent = ltsp && fastSec > 0 && slowSec > 0 ? pacePercentOfLtsp(slowSec, ltsp) : 0;
 
   return {
     access: 0,
@@ -194,8 +248,8 @@ function buildLeafStep(
     intensityCustom: tpl.intensityCustom,
     intensityDisplayUnit: hasPace ? "1" : "0",
     intensityMultiplier: hasPace ? 1000 : 0,
-    intensityPercent: 0,
-    intensityPercentExtend: 0,
+    intensityPercent,
+    intensityPercentExtend,
     intensityType: hasPace ? 8 : 0,
     intensityValue,
     intensityValueExtend,
@@ -270,7 +324,10 @@ function buildGroupMarker(
 }
 
 /** Flatten the nested input model into the flat exercises[] array COROS expects. */
-export function buildRunningSteps(items: RunningItemInput[]): RunningStepPayload[] {
+export function buildRunningSteps(
+  items: RunningItemInput[],
+  ctx: PaceContext = {}
+): RunningStepPayload[] {
   const out: RunningStepPayload[] = [];
   let id = 1;
   for (const item of items) {
@@ -280,11 +337,11 @@ export function buildRunningSteps(items: RunningItemInput[]): RunningStepPayload
       out.push(buildGroupMarker(id, id, item.repeat, item.restSeconds ?? 30));
       id++;
       for (const child of item.steps) {
-        out.push(buildLeafStep(child, id, id, groupId));
+        out.push(buildLeafStep(child, id, id, groupId, ctx));
         id++;
       }
     } else {
-      out.push(buildLeafStep(item, id, id, ""));
+      out.push(buildLeafStep(item, id, id, "", ctx));
       id++;
     }
   }
@@ -295,9 +352,10 @@ export function buildRunningSteps(items: RunningItemInput[]): RunningStepPayload
 export function buildRunningWorkoutPayload(
   name: string,
   overview: string,
-  items: RunningItemInput[]
+  items: RunningItemInput[],
+  ctx: PaceContext = {}
 ): WorkoutPayload {
-  const steps = buildRunningSteps(items);
+  const steps = buildRunningSteps(items, ctx);
   return {
     access: 1,
     authorId: "0",
