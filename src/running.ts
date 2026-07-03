@@ -205,17 +205,20 @@ function buildLeafStep(
     throw new Error(`Step "${input.type}" cannot set both distanceMeters and timeSeconds`);
   }
 
-  // Target: distance -> targetType 2 (meters); time -> targetType 5 (ms).
+  // Target encoding (verified against the on-watch/hub display, NOT just server
+  // acceptance — /calculate returns 0000 even when these are swapped):
+  //   time     -> targetType 2, value = SECONDS,        targetDisplayUnit 0
+  //   distance -> targetType 5, value = CENTIMETERS (m*100), targetDisplayUnit 2
   let targetType: number;
   let targetValue: number;
   let targetDisplayUnit: number;
-  if (input.distanceMeters !== undefined) {
+  if (input.timeSeconds !== undefined) {
     targetType = 2;
-    targetValue = input.distanceMeters;
+    targetValue = input.timeSeconds;
     targetDisplayUnit = 0;
   } else {
     targetType = 5;
-    targetValue = input.timeSeconds! * 1000;
+    targetValue = Math.round(input.distanceMeters! * 100);
     targetDisplayUnit = 2;
   }
 

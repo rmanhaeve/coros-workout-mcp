@@ -81,10 +81,12 @@ describe("buildRunningSteps", () => {
       { type: "warmup", distanceMeters: 2000 },
       { type: "work", timeSeconds: 720, paceFast: "3:54", paceSlow: "4:18" },
     ]);
-    expect(steps[0].targetType).toBe(2); // distance
-    expect(steps[0].targetValue).toBe(2000);
-    expect(steps[1].targetType).toBe(5); // time
-    expect(steps[1].targetValue).toBe(720000); // ms
+    // distance -> targetType 5, value in centimeters
+    expect(steps[0].targetType).toBe(5);
+    expect(steps[0].targetValue).toBe(200000); // 2000 m = 200000 cm
+    // time -> targetType 2, value in seconds
+    expect(steps[1].targetType).toBe(2);
+    expect(steps[1].targetValue).toBe(720); // seconds
     // pace range encoded on the work step
     expect(steps[1].intensityType).toBe(8);
     expect(steps[1].intensityValue).toBe(234000);
