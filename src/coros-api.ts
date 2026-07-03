@@ -21,7 +21,7 @@ import { findByName } from "./exercise-catalog.js";
 
 const CONFIG_DIR = resolve(homedir(), ".config", "coros-workout-mcp");
 const AUTH_FILE = resolve(CONFIG_DIR, "auth.json");
-const DEFAULT_SOURCE_URL =
+export const DEFAULT_SOURCE_URL =
   "https://d31oxp44ddzkyk.cloudfront.net/source/source_default/0/2fbd46e17bc54bc5873415c9fa767bdc.jpg";
 
 // --- Auth ---
@@ -445,6 +445,41 @@ export interface CalculateResult {
   duration: number;
   totalSets: number;
   trainingLoad: number;
+  distance?: number;
+}
+
+/**
+ * Compute load/duration/distance for a prebuilt program payload
+ * (strength or running — same /calculate endpoint).
+ */
+export async function calculateProgram(
+  auth: AuthData,
+  payload: WorkoutPayload
+): Promise<CalculateResult> {
+  const result = (await apiPost(auth, "/training/program/calculate", payload)) as {
+    data: { duration: number; totalSets: number; trainingLoad: number; distance?: number };
+  };
+  return {
+    duration: result.data.duration,
+    totalSets: result.data.totalSets,
+    trainingLoad: result.data.trainingLoad,
+    distance: result.data.distance,
+  };
+}
+
+/** Persist a prebuilt program payload (strength or running — same /add endpoint). */
+export async function addProgram(
+  auth: AuthData,
+  payload: WorkoutPayload,
+  calculated: CalculateResult
+): Promise<unknown> {
+  // Apply calculated values. distance is a string in /add (number in /calculate).
+  payload.duration = calculated.duration;
+  payload.totalSets = calculated.totalSets;
+  payload.distance = String(calculated.distance ?? 0);
+  payload.sets = calculated.totalSets;
+  payload.pitch = 0;
+  return apiPost(auth, "/training/program/add", payload);
 }
 
 export async function calculateWorkout(
@@ -453,15 +488,7 @@ export async function calculateWorkout(
   overview: string,
   exercisePayloads: ExercisePayload[]
 ): Promise<CalculateResult> {
-  const payload = buildWorkoutPayload(name, overview, exercisePayloads);
-  const result = (await apiPost(auth, "/training/program/calculate", payload)) as {
-    data: { duration: number; totalSets: number; trainingLoad: number };
-  };
-  return {
-    duration: result.data.duration,
-    totalSets: result.data.totalSets,
-    trainingLoad: result.data.trainingLoad,
-  };
+  return calculateProgram(auth, buildWorkoutPayload(name, overview, exercisePayloads));
 }
 
 export async function addWorkout(
@@ -471,14 +498,11 @@ export async function addWorkout(
   exercisePayloads: ExercisePayload[],
   calculated: CalculateResult
 ): Promise<unknown> {
-  const payload = buildWorkoutPayload(name, overview, exercisePayloads);
-  // Apply calculated values
-  payload.duration = calculated.duration;
-  payload.totalSets = calculated.totalSets;
-  payload.distance = "0"; // String in add (number in calculate)
-  payload.sets = calculated.totalSets;
-  payload.pitch = 0;
-  return apiPost(auth, "/training/program/add", payload);
+  return addProgram(
+    auth,
+    buildWorkoutPayload(name, overview, exercisePayloads),
+    calculated
+  );
 }
 
 export interface QueryOptions {

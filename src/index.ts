@@ -10,11 +10,17 @@ import {
   resolveExercises,
   calculateWorkout,
   addWorkout,
+  calculateProgram,
+  addProgram,
   queryWorkouts,
   queryExerciseCatalog,
   fetchI18nStrings,
   buildCatalogFromRaw,
 } from "./coros-api.js";
+import {
+  buildRunningWorkoutPayload,
+  type RunningItemInput,
+} from "./running.js";
 import {
   searchExercises,
   findByName,
@@ -261,6 +267,88 @@ server.tool(
           {
             type: "text" as const,
             text: `Failed to create workout: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool: create_running_workout ---
+const RunStepSchema = z.object({
+  type: z
+    .enum(["warmup", "work", "recovery", "cooldown"])
+    .describe("Step role: warmup, work, recovery (between reps), or cooldown"),
+  distanceMeters: z.number().positive().optional().describe("Distance target in meters (e.g. 2000)"),
+  timeSeconds: z.number().positive().optional().describe("Time target in seconds (e.g. 720 for 12 min)"),
+  paceFast: z.string().optional().describe('Fast end of pace target, "m:ss" per km (e.g. "3:54")'),
+  paceSlow: z.string().optional().describe('Slow end of pace target, "m:ss" per km (e.g. "4:18")'),
+});
+const RepeatBlockSchema = z.object({
+  repeat: z.number().int().min(1).describe("Number of times to repeat the child steps"),
+  restSeconds: z.number().int().min(0).optional().describe("Rest between repeats in seconds (default 30)"),
+  steps: z.array(RunStepSchema).min(1).describe("Steps inside the repeat block (e.g. work + recovery)"),
+});
+
+server.tool(
+  "create_running_workout",
+  "Create a structured RUNNING workout on COROS Training Hub (sportType 1). Steps are warmup/work/recovery/cooldown with distance or time targets and optional pace-range targets (COROS adjusted-pace). Intervals use repeat blocks. Set calculateOnly=true to validate the payload against COROS without saving. Syncs to the watch when saved.",
+  {
+    name: z.string().describe("Workout name (e.g. 'Q2 Threshold — 2x12min')"),
+    overview: z.string().default("").describe("Workout description"),
+    steps: z
+      .array(z.union([RepeatBlockSchema, RunStepSchema]))
+      .min(1)
+      .describe("Ordered list of steps and/or repeat blocks"),
+    calculateOnly: z
+      .boolean()
+      .default(false)
+      .describe("If true, validate + compute metrics via /calculate but do NOT save the workout"),
+  },
+  async ({ name, overview, steps, calculateOnly }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return {
+          content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }],
+          isError: true,
+        };
+      }
+
+      const payload = buildRunningWorkoutPayload(name, overview, steps as RunningItemInput[]);
+      const calculated = await calculateProgram(auth, payload);
+
+      if (!calculateOnly) {
+        await addProgram(auth, payload, calculated);
+      }
+
+      const durationMin = Math.round((calculated.duration || 0) / 60);
+      const distanceKm = calculated.distance ? (calculated.distance / 1000).toFixed(2) : "?";
+      const header = calculateOnly
+        ? `Validated running workout "${name}" (NOT saved — calculateOnly).`
+        : `Running workout "${name}" created successfully!`;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              header,
+              `Duration: ~${durationMin} min | Distance: ${distanceKm} km | Training load: ${calculated.trainingLoad}`,
+              calculateOnly ? "" : "The workout will sync to your COROS watch.",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to create running workout: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
         isError: true,
