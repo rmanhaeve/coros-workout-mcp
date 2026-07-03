@@ -21,6 +21,9 @@ import {
   addTrainingPlan,
   executeSubPlan,
   deletePlans,
+  quitSubPlan,
+  querySchedule,
+  queryPlans,
 } from "./coros-api.js";
 import {
   buildRunningWorkoutPayload,
@@ -765,6 +768,155 @@ server.tool(
         ],
         isError: true,
       };
+    }
+  }
+);
+
+// --- Tool: list_scheduled_workouts ---
+// Read the calendar and group entries by their sub-plan instance id (planId),
+// which is the handle unschedule_workouts needs. Workout names aren't in the
+// schedule response, so we summarise by date + step count.
+function fmtHappenDay(hd: string | number): string {
+  const s = String(hd);
+  return s.length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
+}
+
+server.tool(
+  "list_scheduled_workouts",
+  "List workouts currently on the COROS calendar between two dates (schedule/query). Groups them by scheduleId (the sub-plan instance) — pass that scheduleId to unschedule_workouts to remove a scheduled block.",
+  {
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('Start of range "YYYY-MM-DD".'),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('End of range "YYYY-MM-DD".'),
+  },
+  async ({ startDate, endDate }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      const data = await querySchedule(auth, toHappenDay(startDate), toHappenDay(endDate));
+      const ents = data.entities ?? [];
+      if (ents.length === 0) {
+        return { content: [{ type: "text" as const, text: `No workouts scheduled between ${startDate} and ${endDate}.` }] };
+      }
+      // Group by sub-plan instance id.
+      const groups = new Map<string, { dates: Set<string>; steps: number }>();
+      for (const e of ents) {
+        const pid = String(e.planId ?? "");
+        const g = groups.get(pid) ?? { dates: new Set<string>(), steps: 0 };
+        g.dates.add(fmtHappenDay(e.happenDay as string | number));
+        g.steps += Array.isArray(e.exerciseBarChart) ? (e.exerciseBarChart as unknown[]).length : 0;
+        groups.set(pid, g);
+      }
+      const lines = [...groups.entries()].map(([pid, g]) => {
+        const dates = [...g.dates].sort().join(", ");
+        return `  scheduleId ${pid}: ${g.dates.size} day(s) — ${dates}`;
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `${ents.length} scheduled workout(s) between ${startDate} and ${endDate}, in ${groups.size} block(s):`,
+              ...lines,
+              ``,
+              `Remove a block with unschedule_workouts(scheduleId).`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to list scheduled workouts: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// --- Tool: unschedule_workouts ---
+server.tool(
+  "unschedule_workouts",
+  "Remove a scheduled block from the COROS calendar (schedule/quitSubPlan). Pass a scheduleId from list_scheduled_workouts, or a date to remove every block that has a workout on that day. This removes the whole sub-plan instance (all workouts scheduled together), not a single day. Does NOT delete the underlying workouts.",
+  {
+    scheduleId: z.string().optional().describe("Sub-plan instance id from list_scheduled_workouts."),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Alternatively, a date "YYYY-MM-DD"; removes every block with a workout that day.'),
+  },
+  async ({ scheduleId, date }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      if (Number(!!scheduleId) + Number(!!date) !== 1) {
+        throw new Error("Provide exactly one of scheduleId or date.");
+      }
+      let ids: string[];
+      if (scheduleId) {
+        ids = [scheduleId];
+      } else {
+        const hd = toHappenDay(date!);
+        const data = await querySchedule(auth, hd, hd);
+        ids = [...new Set((data.entities ?? []).map((e) => String(e.planId ?? "")).filter(Boolean))];
+        if (ids.length === 0) {
+          return { content: [{ type: "text" as const, text: `Nothing scheduled on ${date}.` }] };
+        }
+      }
+      for (const id of ids) {
+        await quitSubPlan(auth, id);
+      }
+      return {
+        content: [{ type: "text" as const, text: `Removed ${ids.length} scheduled block(s) from the calendar: ${ids.join(", ")}.` }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to unschedule: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// --- Tool: list_training_plans ---
+server.tool(
+  "list_training_plans",
+  "List plans in the COROS Plans library (reusable templates), via plan/query. Returns each plan's id (for delete_training_plan), name, and length.",
+  {
+    name: z.string().default("").describe("Filter by plan name (optional)."),
+    limit: z.number().int().min(1).max(100).default(50).describe("Max plans to return."),
+  },
+  async ({ name, limit }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      const plans = await queryPlans(auth, { name, limitSize: limit });
+      if (plans.length === 0) {
+        return { content: [{ type: "text" as const, text: "No plans found." }] };
+      }
+      const lines = plans.map((p) => {
+        const days = p.totalDay != null ? `, ${p.totalDay} day(s)` : "";
+        return `  ${p.id} — ${p.name ?? "(unnamed)"}${days}`;
+      });
+      return { content: [{ type: "text" as const, text: `${plans.length} plan(s):\n${lines.join("\n")}\n\nDelete with delete_training_plan(planIds).` }] };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to list plans: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+    }
+  }
+);
+
+// --- Tool: delete_training_plan ---
+server.tool(
+  "delete_training_plan",
+  "Delete one or more plan TEMPLATES from the Plans library (plan/delete). This only removes the reusable template; it does NOT remove workouts already placed on the calendar (use unschedule_workouts for that).",
+  {
+    planIds: z.array(z.string()).min(1).describe("Plan ids to delete (from list_training_plans)."),
+  },
+  async ({ planIds }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return { content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }], isError: true };
+      }
+      await deletePlans(auth, planIds);
+      return { content: [{ type: "text" as const, text: `Deleted ${planIds.length} plan template(s): ${planIds.join(", ")}.` }] };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: `Failed to delete plan(s): ${error instanceof Error ? error.message : String(error)}` }], isError: true };
     }
   }
 );

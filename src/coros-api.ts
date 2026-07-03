@@ -647,6 +647,24 @@ export async function deletePlans(
   await apiPost(auth, "/training/plan/delete", planIds);
 }
 
+/**
+ * List plans in the Plans library (templates). POST /training/plan/query.
+ * Returns the plan records (id, name, totalDay, inSchedule, ...).
+ */
+export async function queryPlans(
+  auth: AuthData,
+  options: { name?: string; startNo?: number; limitSize?: number } = {}
+): Promise<Array<Record<string, unknown>>> {
+  const result = (await apiPost(auth, "/training/plan/query", {
+    name: options.name ?? "",
+    startNo: options.startNo ?? 0,
+    limitSize: options.limitSize ?? 50,
+  })) as { data?: Array<Record<string, unknown>> | { dataList?: Array<Record<string, unknown>> } };
+  const d = result.data;
+  if (Array.isArray(d)) return d;
+  return d?.dataList ?? [];
+}
+
 export interface QueryOptions {
   name?: string;
   sportType?: number;
