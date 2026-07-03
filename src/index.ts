@@ -17,11 +17,29 @@ import {
   queryExerciseCatalog,
   fetchI18nStrings,
   buildCatalogFromRaw,
+  getProgramDetail,
+  addTrainingPlan,
+  executeSubPlan,
+  deletePlans,
 } from "./coros-api.js";
 import {
   buildRunningWorkoutPayload,
   type RunningItemInput,
 } from "./running.js";
+import {
+  buildTrainingPlanPayload,
+  dayNoFromDates,
+  toHappenDay,
+  happenDayFromStart,
+  REGION_IDS,
+  type PlanPlacement,
+} from "./plan.js";
+
+/** "YYYY-MM-DD" label for the date `dayNo` days after an ISO anchor. */
+function isoPlusDaysLabel(startISO: string, dayNo: number): string {
+  const ymd = happenDayFromStart(startISO, dayNo); // YYYYMMDD
+  return `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+}
 import {
   searchExercises,
   findByName,
@@ -345,7 +363,8 @@ server.tool(
       }
 
       const durationMin = Math.round((calculated.duration || 0) / 60);
-      const distanceKm = calculated.distance ? (calculated.distance / 1000).toFixed(2) : "?";
+      // calculated.distance is COROS-native centimeters (meters*100).
+      const distanceKm = calculated.distance ? (calculated.distance / 100000).toFixed(2) : "?";
       const header = calculateOnly
         ? `Validated running workout "${name}" (NOT saved — calculateOnly).`
         : `Running workout "${name}" created successfully!`;
@@ -542,6 +561,206 @@ server.tool(
           {
             type: "text" as const,
             text: `Failed to list workouts: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool: schedule_workouts ---
+// COROS has no "assign a workout to a date" call. Scheduling onto the calendar
+// is a three-step flow, all reverse-engineered from the hub:
+//   1. POST /training/plan/add           build a multi-week plan TEMPLATE,
+//                                         placing workouts by dayNo (0-based).
+//   2. schedule/executeSubPlan?startDay= bind that template onto the calendar
+//                                         starting at startDay; each workout
+//                                         lands on startDay + its dayNo. THIS is
+//                                         what puts them on the calendar/watch.
+//   3. plan/delete [templateId]          drop the now-redundant template (the
+//                                         calendar copy is independent, verified).
+// Placement is purely by dayNo + startDay (entity happenDay is left "" — a stale
+// happenDay that disagrees with startDay+dayNo misplaces the workout).
+const ScheduledItemSchema = z
+  .object({
+    workoutId: z
+      .string()
+      .optional()
+      .describe("Id of an existing COROS program to schedule (from list_workouts / a prior create)."),
+    running: z
+      .object({
+        name: z.string().describe("Name for the inline running workout"),
+        overview: z.string().default("").describe("Description"),
+        steps: z
+          .array(z.union([RepeatBlockSchema, RunStepSchema]))
+          .min(1)
+          .describe("Running steps/repeat blocks (same shape as create_running_workout)"),
+      })
+      .optional()
+      .describe("Inline running workout to create and schedule (alternative to workoutId)."),
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe('Calendar date "YYYY-MM-DD" to place this workout on (recommended).'),
+    dayOffset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("0-based day offset from the plan start (alternative to date)."),
+  })
+  .describe("One scheduled workout: a source (workoutId OR running) + a placement (date OR dayOffset).");
+
+server.tool(
+  "schedule_workouts",
+  "Schedule workouts onto the COROS CALENDAR (so they sync to the watch). Each item is an existing workout (workoutId) or an inline running spec, placed on a calendar date or a relative dayOffset. Provide startDate to anchor day 0. Internally: builds a plan template, binds it to the calendar (executeSubPlan), then deletes the template. Set keepAsTemplate=true to skip calendar binding and just leave a reusable plan under Plans.",
+  {
+    name: z.string().describe("Plan name (e.g. 'Week of Jul 6 — GE100k')"),
+    overview: z.string().default("").describe("Plan description"),
+    startDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .describe('Calendar date "YYYY-MM-DD" for day 0. Required unless every item has its own date, or keepAsTemplate=true.'),
+    workouts: z.array(ScheduledItemSchema).min(1).describe("Workouts to place."),
+    keepAsTemplate: z
+      .boolean()
+      .default(false)
+      .describe("If true, only create a reusable Plans-library template (do NOT bind to the calendar)."),
+  },
+  async ({ name, overview, startDate, workouts, keepAsTemplate }) => {
+    try {
+      const auth = await getValidAuth();
+      if (!auth) {
+        return {
+          content: [{ type: "text" as const, text: "Not authenticated. Use authenticate_coros first." }],
+          isError: true,
+        };
+      }
+
+      // Validate each item: exactly one source, exactly one placement.
+      for (const [i, w] of workouts.entries()) {
+        const hasSource = Number(!!w.workoutId) + Number(!!w.running);
+        if (hasSource !== 1) {
+          throw new Error(`workouts[${i}]: provide exactly one of workoutId or running`);
+        }
+        const hasPlacement = Number(w.date !== undefined) + Number(w.dayOffset !== undefined);
+        if (hasPlacement !== 1) {
+          throw new Error(`workouts[${i}]: provide exactly one of date or dayOffset`);
+        }
+      }
+
+      // Anchor date = day 0 of the plan (the executeSubPlan startDay). Explicit
+      // startDate wins, else the earliest per-item date. Required to reach the
+      // calendar; without it we can only leave a template.
+      const usedDates = workouts.map((w) => w.date).filter((d): d is string => !!d).sort();
+      const anchorISO = startDate ?? usedDates[0];
+      if (!anchorISO && !keepAsTemplate) {
+        throw new Error(
+          "Provide startDate (or a date on each workout) to schedule onto the calendar, or set keepAsTemplate=true."
+        );
+      }
+
+      // Fetch pace reference once if any inline running workout is present.
+      let paceCtx: { ltsp?: number | null; ltspZone?: number[] } = {};
+      if (workouts.some((w) => w.running)) {
+        try {
+          paceCtx = await getAccountZones(auth);
+        } catch {
+          paceCtx = {};
+        }
+      }
+
+      const placements: PlanPlacement[] = [];
+      const summaries: string[] = [];
+      for (const w of workouts) {
+        // Placement -> dayNo (relative to the anchor). happenDay stays "" — the
+        // calendar date is decided by executeSubPlan's startDay + dayNo.
+        let dayNo: number;
+        if (w.date !== undefined) {
+          dayNo = anchorISO ? dayNoFromDates(anchorISO, w.date) : 0;
+          if (dayNo < 0) {
+            throw new Error(`Date ${w.date} is before the plan start (${anchorISO}); adjust startDate.`);
+          }
+        } else {
+          dayNo = w.dayOffset!;
+        }
+
+        // Source -> a full program-detail object to embed.
+        let programId: string;
+        let label: string;
+        if (w.workoutId) {
+          programId = w.workoutId;
+          label = `workout ${w.workoutId}`;
+        } else {
+          const spec = w.running!;
+          const payload = buildRunningWorkoutPayload(
+            spec.name,
+            spec.overview,
+            spec.steps as RunningItemInput[],
+            paceCtx
+          );
+          const calculated = await calculateProgram(auth, payload);
+          programId = await addProgram(auth, payload, calculated);
+          label = `run "${spec.name}"`;
+        }
+        const program = await getProgramDetail(auth, programId);
+        placements.push({ program, dayNo });
+
+        const when = anchorISO
+          ? isoPlusDaysLabel(anchorISO, dayNo)
+          : `day ${dayNo}`;
+        summaries.push(`  ${when}: ${program.name ?? label}`);
+      }
+
+      const planPayload = buildTrainingPlanPayload({
+        name,
+        overview,
+        placements,
+        region: REGION_IDS[auth.region] ?? 3,
+      });
+      const planId = await addTrainingPlan(auth, planPayload);
+
+      // Bind to the calendar unless the caller only wants a template.
+      if (!keepAsTemplate && anchorISO) {
+        await executeSubPlan(auth, planId, toHappenDay(anchorISO));
+        // The template is now redundant; the calendar copy is independent.
+        // Best-effort cleanup so we don't litter the Plans library.
+        try {
+          await deletePlans(auth, [planId]);
+        } catch {
+          /* leave the template if cleanup fails; calendar is already set */
+        }
+      }
+
+      const header = keepAsTemplate || !anchorISO
+        ? `Plan template "${name}" created (id ${planId}) — under Plans, NOT on the calendar.`
+        : `Scheduled "${name}" onto your calendar (starts ${anchorISO}).`;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              header,
+              `${placements.length} workout(s) across ${planPayload.totalDay} day(s):`,
+              ...summaries,
+              ``,
+              keepAsTemplate || !anchorISO
+                ? `Re-run with a startDate to place it on the calendar.`
+                : `These will sync to your COROS watch. Verify on the hub calendar.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Failed to schedule workouts: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
         isError: true,

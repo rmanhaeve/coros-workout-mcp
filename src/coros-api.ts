@@ -465,9 +465,11 @@ export function resolveExercises(
 // --- Workout API ---
 
 export interface CalculateResult {
+  /** Seconds. */
   duration: number;
   totalSets: number;
   trainingLoad: number;
+  /** COROS-native distance in CENTIMETERS (meters*100); undefined for strength. */
   distance?: number;
 }
 
@@ -479,30 +481,51 @@ export async function calculateProgram(
   auth: AuthData,
   payload: WorkoutPayload
 ): Promise<CalculateResult> {
+  // /calculate returns two shapes: strength uses duration/totalSets/trainingLoad/
+  // distance; running uses planDuration/planSets/planTrainingLoad/planDistance.
+  // Accept either so both sports report real totals (not NaN/0).
   const result = (await apiPost(auth, "/training/program/calculate", payload)) as {
-    data: { duration: number; totalSets: number; trainingLoad: number; distance?: number };
+    data: {
+      duration?: number;
+      totalSets?: number;
+      trainingLoad?: number;
+      distance?: number | string;
+      planDuration?: number;
+      planSets?: number;
+      planTrainingLoad?: number;
+      planDistance?: number | string;
+    };
   };
+  const d = result.data;
+  const num = (v: number | string | undefined): number | undefined =>
+    v === undefined ? undefined : Number(v);
   return {
-    duration: result.data.duration,
-    totalSets: result.data.totalSets,
-    trainingLoad: result.data.trainingLoad,
-    distance: result.data.distance,
+    duration: d.duration ?? d.planDuration ?? 0,
+    totalSets: d.totalSets ?? d.planSets ?? 0,
+    trainingLoad: d.trainingLoad ?? d.planTrainingLoad ?? 0,
+    distance: num(d.distance ?? d.planDistance),
   };
 }
 
-/** Persist a prebuilt program payload (strength or running — same /add endpoint). */
+/**
+ * Persist a prebuilt program payload (strength or running — same /add endpoint).
+ * Returns the new program's id (the API's `data` field).
+ */
 export async function addProgram(
   auth: AuthData,
   payload: WorkoutPayload,
   calculated: CalculateResult
-): Promise<unknown> {
+): Promise<string> {
   // Apply calculated values. distance is a string in /add (number in /calculate).
   payload.duration = calculated.duration;
   payload.totalSets = calculated.totalSets;
   payload.distance = String(calculated.distance ?? 0);
   payload.sets = calculated.totalSets;
   payload.pitch = 0;
-  return apiPost(auth, "/training/program/add", payload);
+  const result = (await apiPost(auth, "/training/program/add", payload)) as {
+    data: string;
+  };
+  return result.data;
 }
 
 export async function calculateWorkout(
@@ -526,6 +549,102 @@ export async function addWorkout(
     buildWorkoutPayload(name, overview, exercisePayloads),
     calculated
   );
+}
+
+/**
+ * Fetch a single program's full detail (used to embed a workout into a plan).
+ * Returns the raw `data` object as COROS stores it — includes exercises[],
+ * exerciseBarChart, duration/distance/trainingLoad, etc.
+ */
+export async function getProgramDetail(
+  auth: AuthData,
+  id: string
+): Promise<Record<string, unknown>> {
+  const result = (await apiGet(auth, "/training/program/detail", {
+    supportRestExercise: 1,
+    id,
+  })) as { data: Record<string, unknown> };
+  return result.data;
+}
+
+/**
+ * Create a multi-week training plan (schedule) that places workouts on days.
+ * POST /training/plan/add. Returns the new plan id (the API's `data` field).
+ *
+ * NOTE: this only creates a Plans-library TEMPLATE (inSchedule 0, no dates).
+ * Call executeSubPlan() to bind it to real calendar dates.
+ */
+export async function addTrainingPlan(
+  auth: AuthData,
+  payload: unknown
+): Promise<string> {
+  const result = (await apiPost(auth, "/training/plan/add", payload)) as {
+    data: string;
+  };
+  return result.data;
+}
+
+/**
+ * Bind a plan template onto the calendar starting at `startDay` ("YYYYMMDD").
+ * POST /training/schedule/executeSubPlan?startDay=&subPlanId= (empty body).
+ * Each plan workout lands on startDay + its dayNo. This is what actually puts
+ * workouts on the calendar (and syncs them to the watch).
+ */
+export async function executeSubPlan(
+  auth: AuthData,
+  subPlanId: string,
+  startDay: string
+): Promise<void> {
+  const path = `/training/schedule/executeSubPlan?startDay=${encodeURIComponent(
+    startDay
+  )}&subPlanId=${encodeURIComponent(subPlanId)}`;
+  await apiPost(auth, path, {});
+}
+
+/**
+ * Remove an executed sub-plan from the calendar ("exit plan").
+ * POST /training/schedule/quitSubPlan?subPlanId= (empty body). The id is the
+ * CALENDAR sub-plan instance id (a scheduled entity's planId), NOT the library
+ * plan id. This is distinct from deletePlans(): quitting clears calendar
+ * entries; deleting only removes the reusable template.
+ */
+export async function quitSubPlan(
+  auth: AuthData,
+  subPlanId: string
+): Promise<void> {
+  const path = `/training/schedule/quitSubPlan?subPlanId=${encodeURIComponent(
+    subPlanId
+  )}`;
+  await apiPost(auth, path, {});
+}
+
+/**
+ * Read the calendar between two "YYYYMMDD" dates. Returns the schedule `data`
+ * object (its `entities[]` are the scheduled workouts, each with a `planId`
+ * that can be passed to quitSubPlan()).
+ */
+export async function querySchedule(
+  auth: AuthData,
+  startDate: string,
+  endDate: string
+): Promise<{ entities?: Array<Record<string, unknown>> } & Record<string, unknown>> {
+  const result = (await apiGet(auth, "/training/schedule/query", {
+    startDate,
+    endDate,
+    supportRestExercise: 1,
+  })) as { data: { entities?: Array<Record<string, unknown>> } & Record<string, unknown> };
+  return result.data;
+}
+
+/**
+ * Delete one or more plan templates. POST /training/plan/delete with a JSON
+ * array of plan ids.
+ */
+export async function deletePlans(
+  auth: AuthData,
+  planIds: string[]
+): Promise<void> {
+  await apiPost(auth, "/training/plan/delete", planIds);
 }
 
 export interface QueryOptions {

@@ -1,0 +1,78 @@
+# COROS Training Hub — calendar scheduling lifecycle (reverse-engineered)
+# Source: HAR exports from trainingeu.coros.com (2026-07-03). Region 3 = EU
+# (teameuapi.coros.com). SECRETS REDACTED: accessToken, CPL-coros-token,
+# _ga cookies, YFHeader userId. Do not un-redact before committing.
+#
+# KEY FINDING: POST /training/plan/add only creates a Plans-library TEMPLATE
+# (inSchedule 0, startDay null). To put workouts on the CALENDAR (and thus sync
+# them to the watch) you must "execute" that template onto a start date. The
+# full lifecycle is four undocumented endpoints:
+#
+#   1. POST /training/plan/add                      -> build day-offset template
+#      (body fully decoded in research/schedule-plan-request-all.txt)
+#      returns: {"result":"0000","data":"<templatePlanId>"}
+#
+#   2. POST /training/schedule/executeSubPlan?startDay=YYYYMMDD&subPlanId=<templatePlanId>
+#      body: {}   (empty)  -> copies the template onto the calendar; each plan
+#      workout lands on startDay + its dayNo. Creates an independent calendar
+#      "sub-plan instance" (new plan/program ids). returns {"result":"0000"}.
+#
+#   3. POST /training/plan/delete
+#      body: ["<planId>", ...]   -> deletes plan TEMPLATES only. Verified: this
+#      does NOT remove already-executed calendar entries.
+#
+#   4. POST /training/schedule/quitSubPlan?subPlanId=<calendarSubPlanInstanceId>
+#      body: {}   -> "exit plan": removes an executed sub-plan from the calendar.
+#      The id is the scheduled entity's planId (from schedule/query), NOT the
+#      template id. Distinct from plan/delete.
+#
+# Reads:
+#   GET /training/plan/detail?id=<id>&region=3&supportRestExercise=1  (template)
+#   GET /training/schedule/query?startDate=YYYYMMDD&endDate=YYYYMMDD&supportRestExercise=1
+#       -> data.entities[] are the scheduled workouts; each entity.planId is the
+#          sub-plan instance id to pass to quitSubPlan. (In the calendar, dayNo
+#          is an ABSOLUTE day index, not the 0-based offset used in a template.)
+#   POST /training/plan/query   body {"name":"","startNo":0,"limitSize":N}
+#       -> lists library templates AND executed instances.
+#
+# The MCP `schedule_workouts` tool runs 1 -> 2 -> 3: build template, execute at
+# startDay, delete the redundant template (calendar copy survives). Entity
+# happenDay is left "" — placement is by startDay + dayNo; a happenDay that
+# disagrees with startDay+dayNo misplaces the workout (observed).
+
+
+# --- 1. POST /training/plan/add (see schedule-plan-request-all.txt for full body) ---
+# returns {"result":"0000","data":"<templatePlanId>"}
+
+
+# --- 2. POST /training/schedule/executeSubPlan (bind template to calendar) ---
+curl 'https://teameuapi.coros.com/training/schedule/executeSubPlan?startDay=20260706&subPlanId=REDACTED_TEMPLATE_PLAN_ID' \
+  -X POST \
+  -H 'accept: application/json, text/plain, */*' \
+  -H 'accesstoken: REDACTED_ACCESS_TOKEN' \
+  -H 'content-type: application/json' \
+  -H 'origin: https://trainingeu.coros.com' \
+  -H 'referer: https://trainingeu.coros.com/' \
+  -H 'yfheader: {"userId":"000000000000000000"}' \
+  --data-raw '{}' ;
+# response: {"apiCode":"...","message":"OK","result":"0000"}
+
+
+# --- 3. POST /training/plan/delete (delete template(s), does NOT clear calendar) ---
+curl 'https://teameuapi.coros.com/training/plan/delete' \
+  -X POST \
+  -H 'accesstoken: REDACTED_ACCESS_TOKEN' \
+  -H 'content-type: application/json' \
+  -H 'yfheader: {"userId":"000000000000000000"}' \
+  --data-raw '["REDACTED_TEMPLATE_PLAN_ID"]' ;
+# response: {"apiCode":"...","message":"OK","result":"0000"}
+
+
+# --- 4. POST /training/schedule/quitSubPlan (remove executed plan from calendar) ---
+curl 'https://teameuapi.coros.com/training/schedule/quitSubPlan?subPlanId=REDACTED_SUBPLAN_INSTANCE_ID' \
+  -X POST \
+  -H 'accesstoken: REDACTED_ACCESS_TOKEN' \
+  -H 'content-type: application/json' \
+  -H 'yfheader: {"userId":"000000000000000000"}' \
+  --data-raw '{}' ;
+# response: {"apiCode":"...","message":"OK","result":"0000"}
